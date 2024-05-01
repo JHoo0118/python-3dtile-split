@@ -1,0 +1,1 @@
+from .collected_info_model import *
