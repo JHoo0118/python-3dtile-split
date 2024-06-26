@@ -4,6 +4,8 @@ from utils import to_dict, extract_non_null_attributes
 
 class BatchTableService(object):
     _instance = None
+
+    additional_keys = ["wbs"]
     exclude_keys: list[str] = ["representation", "objectPlacement", "ownerHistory"]
 
     def __new__(cls, *args, **kwargs):
@@ -21,6 +23,9 @@ class BatchTableService(object):
         for key in project_dict:
             if key in self.exclude_keys:
                 continue
+            batch_table[key] = []
+        
+        for key in self.additional_keys:
             batch_table[key] = []
         return batch_table, batch_table_mapping
     

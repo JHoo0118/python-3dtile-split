@@ -4,6 +4,7 @@ import ifcopenshell
 import ifcopenshell.geom
 import struct
 import numpy as np
+from ifcopenshell.entity_instance import entity_instance
 from types import SimpleNamespace
 from functools import partial
 from pygltflib import (
@@ -325,12 +326,27 @@ class IfcService(object):
         
         address_lines = building_address.AddressLines if hasattr(building_address, 'AddressLines') else []
         return ', '.join(address_lines)
+    
+
+    def __get_wbs_data(self, element: entity_instance) -> str:
+        for rel in element.IsDefinedBy:
+          if rel.is_a("IfcRelDefinesByProperties"):
+              prop_set = rel.RelatingPropertyDefinition
+              if prop_set.is_a("IfcPropertySet"):
+                  for prop in prop_set.HasProperties:
+                      if prop.is_a("IfcPropertySingleValue") and prop.Name == 'WBS':
+                          wbs_value = prop.NominalValue.wrappedValue
+                          return wbs_value
+        return ""
 
     def __extract_ifc_data(self, element):
         if not hasattr(element, 'Representation') or not element.Representation:
           return None
         
         element_dict = to_dict(element, self._batch_table_service.exclude_keys)
+
+        wbs = self.__get_wbs_data(element)
+        element_dict["wbs"] = wbs
         element_data = {key: '' for key in self._batch_table}
         element_data.update(element_dict)
 
