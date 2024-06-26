@@ -37,6 +37,8 @@ class CollectedInfo(BaseModel):
     accessor_indices: dict[int, int]
     bufferView_indices: dict[int, int]
     node_indices: set[int]
+    batch_table: dict[str, list]
+    batch_table_mapping: dict
 
     class Config:
         arbitrary_types_allowed = True

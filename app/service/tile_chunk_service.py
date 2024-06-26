@@ -19,12 +19,14 @@ from pygltflib import (
     Attributes,
     Skin,
 )
+from service.ifc_service import IfcService
 
 from model.collected_info_model import CollectedInfo
 
 class TileChunkService(object):
     _instance = None
     _material_property_paths = []
+    _ifc_service: IfcService
 
     def __new__(cls, *args, **kwargs):
         if not isinstance(cls._instance, cls):
@@ -33,7 +35,7 @@ class TileChunkService(object):
         return cls._instance
 
     def __init__(self) -> None:
-        
+        self._ifc_service = IfcService()
         self._material_property_paths = [
             "pbrMetallicRoughness.baseColorTexture",
             "pbrMetallicRoughness.metallicRoughnessTexture",
@@ -42,7 +44,7 @@ class TileChunkService(object):
             "emissiveTexture",
         ]
 
-    def __init_collected_info(self) -> CollectedInfo:
+    def __init_collected_info(self):
         return CollectedInfo(
             nodes=[],
             meshes=[],
@@ -57,17 +59,19 @@ class TileChunkService(object):
             samplers=[],
             skins=[],
             scene_node_indices=[],
-            skins_indices=dict(),
-            meshes_indices=dict(),
-            material_indices=dict(),
-            samplers_indices=dict(),
-            images_indices=dict(),
-            textures_indices=dict(),
-            accessor_indices=dict(),
-            bufferView_indices=dict(),
+            skins_indices={},
+            meshes_indices={},
+            material_indices={},
+            samplers_indices={},
+            images_indices={},
+            textures_indices={},
+            accessor_indices={},
+            bufferView_indices={},
             node_indices=set(),
+            batch_table={},
+            batch_table_mapping={},
         )
-    
+
     def __collect_mesh_material_texture_info(
         self,
         gltf: GLTF2,
@@ -285,6 +289,7 @@ class TileChunkService(object):
         self,
         current_node: Node,
         gltf: GLTF2,
+        batch_table_mapping: dict,
         collected_info: CollectedInfo,
     ) -> None:
         if current_node.mesh is not None:
@@ -307,6 +312,20 @@ class TileChunkService(object):
                         collected_info=collected_info,
                     )
                 collected_info.meshes.append(mesh)
+            if gltf.extensions.get("EXT_structural_metadata") and batch_table_mapping:
+                mapping_key = mesh.name + str(current_node.mesh)
+                batch_data: dict = batch_table_mapping[mapping_key]
+                collected_info.batch_table_mapping[mapping_key] = {}
+                collected_info.batch_table["batchId"].append(current_node.mesh)
+
+                for key, value in batch_data.items():
+                  if key == "batchId":
+                    continue
+                  collected_info.batch_table[key].append(value)
+                  collected_info.batch_table_mapping[mapping_key][key] = value
+
+                collected_info.batch_table_mapping[mapping_key]["batchId"] = collected_info.meshes_indices[current_node.mesh]
+
 
     def __collect_skin_info(
         self,
@@ -355,6 +374,7 @@ class TileChunkService(object):
         gltf: GLTF2,
         node_index: int,
         split_size: int,
+        batch_table_mapping: dict,
         collected_info: CollectedInfo = None,
         parent_scene_indices: list = None,
     ) -> CollectedInfo:
@@ -385,6 +405,7 @@ class TileChunkService(object):
         self.__collect_mesh_info(
             current_node=current_node,
             gltf=gltf,
+            batch_table_mapping=batch_table_mapping,
             collected_info=collected_info,
         )
 
@@ -412,6 +433,7 @@ class TileChunkService(object):
                         node_index=child_index,
                         split_size=split_size,
                         collected_info=collected_info,
+                        batch_table_mapping=batch_table_mapping
                     )
 
         return collected_info
@@ -949,13 +971,16 @@ class TileChunkService(object):
             bufferView.buffer = 0
             bufferView.byteOffset = new_buffer_view_offsets[i]
 
-    def __copy_extensions(self, original_gltf: GLTF2, new_gltf: GLTF2) -> None:
+    def __copy_extensions(self, original_gltf: GLTF2, new_gltf: GLTF2, input_batch_table: dict, collected_info: CollectedInfo,) -> None:
       if original_gltf.extensionsRequired is not None:
         new_gltf.extensionsRequired = copy.deepcopy(original_gltf.extensionsRequired)
       if original_gltf.extensionsUsed is not None:
         new_gltf.extensionsUsed = copy.deepcopy(original_gltf.extensionsUsed)
       if original_gltf.extensions is not None:
         new_gltf.extensions = copy.deepcopy(original_gltf.extensions)
+
+      if new_gltf.extensions.get("EXT_structural_metadata"):
+        collected_info.batch_table = {key: [] for key in input_batch_table}
 
     def __set_animations(
         self,
@@ -1069,8 +1094,75 @@ class TileChunkService(object):
                 visit_node(node_index)
 
         return parent_map
+    
+    def __reconstruct_extensions_structural_metadata(self, gltf: GLTF2, collected_batch_table: dict):
+        return self._ifc_service.create_structural_metadata(gltf, collected_batch_table)
+    
+    def __on_process_by_total_nodes(
+            self,
+            total_nodes: int,
+            batch_table: dict[str, list],
+            batch_table_mapping: dict,
+            mesh_name_mapping: dict[str, str],
+            original_gltf: GLTF2,
+            copied_original_gltf: GLTF2,
+            base_name: str,
+            output_dir: str,
+    ) -> bool:
+        if total_nodes > 400 and batch_table:
+            structural_metadata_output, structural_metadata_buffer_data_output = (
+                  self._ifc_service.create_structural_metadata(copied_original_gltf, batch_table, False)
+            )
 
-    def split_model_by_nodes(self, input_glb_path: str, split_size: int = 100, output_dir: str = "./outputs") -> None:
+            self._ifc_service.add_structural_metadata_to_gltf(
+                gltf=copied_original_gltf,
+                bin_filename=f"{base_name}_feature_metadata_buffer.bin",
+                output_dir=output_dir,
+                structural_metadata=structural_metadata_output,
+                structural_metadata_buffer_data=structural_metadata_buffer_data_output,
+                save=False,
+            )
+            return False
+
+        elif batch_table:
+            structural_metadata_output, structural_metadata_buffer_data_output = (
+                self._ifc_service.create_structural_metadata(original_gltf, batch_table, True)
+            )
+
+            self._ifc_service.add_structural_metadata_to_gltf(
+                gltf=original_gltf,
+                bin_filename=f"{base_name}_feature_metadata_buffer.bin",
+                output_dir=output_dir,
+                structural_metadata=structural_metadata_output,
+                structural_metadata_buffer_data=structural_metadata_buffer_data_output,
+                save=True,
+            )
+
+            self._ifc_service.generate_feature_data(
+                gltf=original_gltf,
+                output_dir=output_dir,
+                output_path=f"{base_name}_feature_ids_buffer.bin",
+                batch_table=batch_table,
+                batch_table_mapping=batch_table_mapping,
+                mesh_name_mapping=mesh_name_mapping
+            )
+            
+            gltf_filename = f"{base_name}_{1}.glb"
+            output_file_path = os.path.join(output_dir, gltf_filename)
+            original_gltf.save(output_file_path)
+            print(f"Saved: {output_file_path}")
+            return True
+
+    def split_model_by_nodes(
+            self,
+            input_glb_path: str,
+            batch_table: dict[str, list] = None,
+            batch_table_mapping: dict = None,
+            mesh_name_mapping: dict[str, str] = None,
+            split_size: int = 100,
+            output_dir: str = "./outputs",
+            
+        ) -> None:
         base_name = os.path.splitext(os.path.basename(input_glb_path))[0]
         os.makedirs(output_dir, exist_ok=True)
 
@@ -1094,22 +1186,32 @@ class TileChunkService(object):
         mesh_index_map = {}
         texture_index_map = {}
 
-        if total_nodes <= 400:
-            gltf_filename = f"{base_name}_{1}.glb"
-            output_file_path = os.path.join(output_dir, gltf_filename)
-            original_gltf.save(output_file_path)
-            print(f"Saved: {output_file_path}")
+        is_finished = self.__on_process_by_total_nodes(
+            original_gltf=original_gltf,
+            copied_original_gltf=copied_original_gltf,
+            base_name=base_name,
+            output_dir=output_dir,
+            batch_table=batch_table,
+            batch_table_mapping=batch_table_mapping,
+            mesh_name_mapping=mesh_name_mapping,
+            total_nodes=total_nodes
+        )
+
+        if is_finished:
             return
 
         for file_index in range(total_files):
             new_gltf = GLTF2()
+            
+            collected_info = self.__init_collected_info()
 
             self.__copy_extensions(
                 original_gltf=copied_original_gltf,
                 new_gltf=new_gltf,
+                input_batch_table=batch_table,
+                collected_info=collected_info,
             )
 
-            collected_info = self.__init_collected_info()
 
             start_node_index = file_index * split_size
             end_node_index = min(start_node_index + split_size, total_nodes)
@@ -1122,6 +1224,7 @@ class TileChunkService(object):
                     node_index=node_index,
                     split_size=split_size,
                     collected_info=collected_info,
+                    batch_table_mapping=batch_table_mapping
                 )
                 self.__set_animations(
                     original_gltf=copied_original_gltf,
@@ -1156,6 +1259,47 @@ class TileChunkService(object):
                 output_directory=output_dir,
                 bin_filename=bin_filename,
             )
+
+            if new_gltf.extensions.get("EXT_structural_metadata"):
+                zero_base_batch_table = copy.deepcopy(collected_info.batch_table)
+                zero_base_batch_table["batchId"] = [i for i in range(len(collected_info.batch_table["batchId"]))]
+
+                (
+                    reconstructed_structural_metadata_output,
+                    reconstructed_structural_metadata_buffer_data_output,
+                ) = self.__reconstruct_extensions_structural_metadata(
+                    gltf=new_gltf,
+                    collected_batch_table=zero_base_batch_table,
+                )
+
+                self._ifc_service.add_structural_metadata_to_gltf(
+                    gltf=new_gltf,
+                    bin_filename=f"{base_name}_feature_metadata_buffer_{file_index + 1}.bin",
+                    output_dir=output_dir,
+                    structural_metadata=reconstructed_structural_metadata_output,
+                    structural_metadata_buffer_data=reconstructed_structural_metadata_buffer_data_output,
+                )
+
+                feature_ids_buffer_data_output_path=f"{base_name}_feature_ids_buffer_{file_index + 1}.bin"
+                feature_ids_buffer_data = bytearray()
+                
+                for mesh_index, mesh in enumerate(new_gltf.meshes):
+                    origin_mesh_index = {key for key in collected_info.meshes_indices if collected_info.meshes_indices[key] == mesh_index}.pop()
+                    self._ifc_service.generate_feature_data_helper(
+                        gltf=new_gltf,
+                        feature_ids_buffer_data=feature_ids_buffer_data,
+                        mesh_index=origin_mesh_index,
+                        mesh=mesh,
+                        batch_table=collected_info.batch_table,
+                        batch_table_mapping=collected_info.batch_table_mapping,
+                        mesh_name_mapping=mesh_name_mapping
+                    )
+              
+                feature_id_buffer = Buffer(uri=feature_ids_buffer_data_output_path, byteLength=len(feature_ids_buffer_data))
+                new_gltf.buffers.append(feature_id_buffer)
+
+                with open(f"{output_dir}/{feature_ids_buffer_data_output_path}", "wb") as f:
+                    f.write(feature_ids_buffer_data)
 
             output_file_path = os.path.join(output_dir, gltf_filename)
             new_gltf.save(output_file_path)
